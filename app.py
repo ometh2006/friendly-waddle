@@ -1,8 +1,9 @@
 """
-Smart Video Compressor — FastAPI backend
-HTML is embedded directly — no static/ folder needed.
+Smart Video Compressor — FastAPI + yt-dlp + FFmpeg
+yt-dlp handles GoFile auth/redirects/MOV files reliably.
+Flow: GoFile URL → yt-dlp download to /tmp → FFmpeg encode → serve download
 """
-import os, re, uuid, time, subprocess, threading, requests
+import os, re, uuid, time, subprocess, threading, shutil, requests
 from pathlib import Path
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
@@ -18,9 +19,12 @@ def _cleanup():
     while True:
         time.sleep(1800)
         now = time.time()
-        for f in WORK_DIR.glob("*.mp4"):
-            if now - f.stat().st_mtime > 3600:
-                f.unlink(missing_ok=True)
+        for f in WORK_DIR.glob("*"):
+            try:
+                if now - f.stat().st_mtime > 3600:
+                    f.unlink(missing_ok=True)
+            except Exception:
+                pass
 
 threading.Thread(target=_cleanup, daemon=True).start()
 
@@ -32,66 +36,60 @@ PRESETS = {
     "720p": {"scale": "1280:720", "bitrate": "1500k", "ab": "128k", "crf": "24"},
 }
 
-_UA      = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-_REFERER = "https://gofile.io/"
-_sess    = requests.Session()
-_sess.headers.update({"User-Agent": _UA, "Referer": _REFERER})
+# ── Download with yt-dlp (handles GoFile auth + MOV/MP4) ─────────────────────
+def download_with_ytdlp(url: str, out_dir: Path, job_id: str) -> Path:
+    """
+    Use yt-dlp to download the video to out_dir.
+    yt-dlp has a native GoFile extractor — handles cookies, redirects, MOV files.
+    Returns the path of the downloaded file.
+    """
+    out_template = str(out_dir / f"src_{job_id}.%(ext)s")
 
-# ── GoFile API ────────────────────────────────────────────────────────────────
-def _gofile_token():
-    r = _sess.post("https://api.gofile.io/accounts", timeout=15)
-    r.raise_for_status()
-    d = r.json()
-    if d.get("status") != "ok":
-        raise RuntimeError(f"GoFile token error: {d}")
-    return d["data"]["token"]
+    cmd = [
+        "yt-dlp",
+        "--no-playlist",
+        "--no-warnings",
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/bestvideo+bestaudio/best",
+        "--merge-output-format", "mp4",
+        "-o", out_template,
+        url,
+    ]
 
-def resolve_url(raw: str):
-    """Returns (direct_url, filename, size_bytes, token_or_None)"""
-    if "gofile.io/d/" in raw or "gofile.io/?c=" in raw:
-        m = re.search(r"gofile\.io/(?:d/|\?c=)([A-Za-z0-9]+)", raw)
-        if not m:
-            raise ValueError("Cannot parse GoFile content ID.")
-        cid = m.group(1)
-        tok = _gofile_token()
-        _sess.cookies.set("accountToken", tok)
-        r = _sess.get(
-            f"https://api.gofile.io/contents/{cid}",
-            params={"token": tok, "wt": "4fd6sg89d7s6"},
-            timeout=15,
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"yt-dlp failed (code {result.returncode}):\n"
+            f"{result.stderr[-2000:]}"
         )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("status") != "ok":
-            raise RuntimeError(f"GoFile API error: {data}")
-        for child in data["data"].get("children", {}).values():
-            if child.get("type") == "file" and child.get("mimetype", "").startswith("video"):
-                return child["link"], child.get("name", "video.mp4"), child.get("size", 0), tok
-        raise RuntimeError("No video found in this GoFile share.")
-    else:
-        fname = raw.split("?")[0].rstrip("/").split("/")[-1] or "video.mp4"
-        try:
-            h    = _sess.head(raw, timeout=10, allow_redirects=True)
-            size = int(h.headers.get("content-length", 0))
-        except Exception:
-            size = 0
-        return raw, fname, size, None
 
-# ── FFmpeg encoder ────────────────────────────────────────────────────────────
-def encode(direct_url: str, preset: str, output_path: str, token: str = None):
+    # Find the downloaded file
+    for ext in ("mp4", "mkv", "mov", "webm", "avi"):
+        candidate = out_dir / f"src_{job_id}.{ext}"
+        if candidate.exists():
+            return candidate
+
+    # Fallback: find any src_ file
+    matches = list(out_dir.glob(f"src_{job_id}.*"))
+    if matches:
+        return matches[0]
+
+    raise RuntimeError("yt-dlp ran but output file not found.")
+
+# ── FFmpeg encode from local file ─────────────────────────────────────────────
+def encode(src_path: str, preset: str, output_path: str):
+    """
+    Encode a local file to the target preset.
+    Source file is local so moov/seek issues don't apply.
+    """
     p  = PRESETS[preset]
     vf = (
         f"scale={p['scale']}:force_original_aspect_ratio=decrease,"
         f"pad={p['scale']}:(ow-iw)/2:(oh-ih)/2"
     )
-    headers_str = f"User-Agent: {_UA}\r\nReferer: {_REFERER}\r\n"
-    if token:
-        headers_str += f"Cookie: accountToken={token}\r\n"
-
     cmd = [
         "ffmpeg", "-y",
-        "-headers", headers_str,
-        "-i", direct_url,
+        "-i", src_path,
         "-vf", vf,
         "-c:v", "libx264", "-b:v", p["bitrate"], "-crf", p["crf"],
         "-c:a", "aac",     "-b:a", p["ab"],
@@ -100,7 +98,7 @@ def encode(direct_url: str, preset: str, output_path: str, token: str = None):
         "-threads", "2",
         output_path,
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-3000:])
 
@@ -125,27 +123,42 @@ def compress(req: CompressRequest):
     url = req.url.strip()
     if not url:
         raise HTTPException(400, "URL is required.")
-    try:
-        direct_url, fname, orig_bytes, token = resolve_url(url)
-    except Exception as e:
-        raise HTTPException(400, f"URL resolve error: {e}")
 
     job_id  = uuid.uuid4().hex[:10]
-    base    = re.sub(r"\.[^.]+$", "", fname)
-    base    = re.sub(r"[^\w._-]", "_", base).strip("_") or "video"
-    outname = f"{base}_{req.preset}_{job_id}.mp4"
-    outpath = str(WORK_DIR / outname)
+    job_dir = WORK_DIR / job_id
+    job_dir.mkdir(exist_ok=True)
 
+    src_path = None
     t0 = time.time()
+
     try:
-        encode(direct_url, req.preset, outpath, token=token)
-    except Exception as e:
-        raise HTTPException(500, f"Encoding failed: {e}")
+        # Step 1: download via yt-dlp
+        try:
+            src_path = download_with_ytdlp(url, job_dir, job_id)
+        except Exception as e:
+            raise HTTPException(500, f"Download failed: {e}")
+
+        orig_bytes = src_path.stat().st_size
+        orig_name  = src_path.stem  # filename without extension
+
+        # Step 2: encode with FFmpeg
+        outname = f"{orig_name}_{req.preset}.mp4"
+        outpath = str(WORK_DIR / outname)
+
+        try:
+            encode(str(src_path), req.preset, outpath)
+        except Exception as e:
+            raise HTTPException(500, f"Encoding failed: {e}")
+
+    finally:
+        # Always clean up the source download
+        if job_dir.exists():
+            shutil.rmtree(job_dir, ignore_errors=True)
 
     elapsed    = time.time() - t0
     comp_bytes = os.path.getsize(outpath)
-    orig_mb    = orig_bytes / (1024*1024) if orig_bytes else comp_bytes / (1024*1024)
-    comp_mb    = comp_bytes / (1024*1024)
+    orig_mb    = orig_bytes / (1024 * 1024)
+    comp_mb    = comp_bytes / (1024 * 1024)
     saved_pct  = round((1 - comp_mb / orig_mb) * 100, 1) if orig_mb else 0
 
     return CompressResponse(
@@ -157,13 +170,14 @@ def compress(req: CompressRequest):
         elapsed_sec = round(elapsed, 1),
     )
 
+
 @app.get("/api/download/{filename}")
 def download(filename: str):
     if "/" in filename or ".." in filename:
         raise HTTPException(400, "Invalid filename.")
     path = WORK_DIR / filename
     if not path.exists():
-        raise HTTPException(404, "File not found or expired.")
+        raise HTTPException(404, "File not found or expired (files are kept for 1 hour).")
     return FileResponse(
         path       = str(path),
         media_type = "video/mp4",
@@ -171,15 +185,18 @@ def download(filename: str):
         headers    = {"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
-# ── Frontend (embedded — no static/ folder needed) ───────────────────────────
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return HTML
 
+
+# ── Embedded Frontend ─────────────────────────────────────────────────────────
 HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -205,7 +222,7 @@ HTML = """<!DOCTYPE html>
     color:var(--accent2);font-size:.72rem;font-weight:600;padding:3px 10px;border-radius:99px;
     margin-top:12px;letter-spacing:.5px;text-transform:uppercase}
   .card{background:var(--card);border:1px solid var(--border);border-radius:var(--radius);
-        padding:28px;width:100%;max-width:620px}
+        padding:28px;width:100%;max-width:640px}
   label{display:block;font-size:.8rem;font-weight:600;color:var(--muted);
         text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px}
   input[type=text]{width:100%;background:var(--bg);border:1px solid var(--border);
@@ -231,11 +248,13 @@ HTML = """<!DOCTYPE html>
   .progress-label{display:flex;justify-content:space-between;font-size:.82rem;color:var(--muted);margin-bottom:8px}
   .progress-bar-bg{background:var(--bg);border-radius:99px;height:8px;overflow:hidden;border:1px solid var(--border)}
   .progress-bar{background:linear-gradient(90deg,var(--accent),var(--accent2));height:100%;
-    width:0%;border-radius:99px;transition:width .4s ease}
+    width:0%;border-radius:99px;transition:width .5s ease}
   .spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(108,99,255,.3);
     border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;
     vertical-align:middle;margin-right:6px}
   @keyframes spin{to{transform:rotate(360deg)}}
+  .phase{font-size:.75rem;color:var(--accent2);font-weight:600;letter-spacing:.4px;
+         text-transform:uppercase;margin-top:6px}
   .result{display:none;margin-top:22px;background:var(--bg);border:1px solid var(--border);
     border-radius:12px;padding:20px}
   .result.success{border-color:rgba(34,197,94,.35)}
@@ -253,29 +272,34 @@ HTML = """<!DOCTYPE html>
     color:var(--green);font-weight:700;font-size:.95rem;padding:12px;cursor:pointer;
     text-decoration:none;transition:background .2s}
   .dl-btn:hover{background:rgba(34,197,94,.22)}
-  .error-msg{font-size:.82rem;color:var(--red);font-family:monospace;white-space:pre-wrap;word-break:break-word;line-height:1.5}
-  .how{margin-top:32px;width:100%;max-width:620px}
+  .error-msg{font-size:.8rem;color:var(--red);font-family:monospace;white-space:pre-wrap;
+             word-break:break-word;line-height:1.5;max-height:220px;overflow-y:auto;
+             background:rgba(239,68,68,.06);padding:12px;border-radius:8px}
+  .how{margin-top:32px;width:100%;max-width:640px}
   .how h3{font-size:.75rem;text-transform:uppercase;letter-spacing:.8px;color:var(--muted);margin-bottom:12px}
   .steps{display:flex;flex-direction:column;gap:8px}
   .step{display:flex;align-items:flex-start;gap:12px;background:var(--card);
     border:1px solid var(--border);border-radius:10px;padding:12px 16px;font-size:.85rem;color:var(--muted)}
   .step-icon{font-size:1.1rem;flex-shrink:0}
   .step b{color:var(--text)}
+  .tip{margin-top:16px;padding:12px 16px;background:rgba(108,99,255,.08);
+    border:1px solid rgba(108,99,255,.2);border-radius:10px;font-size:.82rem;color:var(--muted)}
+  .tip b{color:var(--accent2)}
 </style>
 </head>
 <body>
 
 <div class="header">
   <h1>🎬 Smart Video Compressor</h1>
-  <p>Paste a GoFile link — get back a small, compressed video file.</p>
-  <span class="badge">✦ HD file never saved to disk</span>
+  <p>Paste a GoFile link — get a compressed video back.</p>
+  <span class="badge">✦ Powered by yt-dlp + FFmpeg</span>
 </div>
 
 <div class="card">
   <div class="field">
     <label>GoFile Share Link or Direct Video URL</label>
     <input type="text" id="urlInput"
-           placeholder="https://gofile.io/d/XXXXXX  or  https://…/video.mp4"/>
+           placeholder="https://gofile.io/d/XXXXXX"/>
   </div>
 
   <label style="margin-bottom:10px">Output Quality</label>
@@ -298,8 +322,8 @@ HTML = """<!DOCTYPE html>
 
   <div class="progress-wrap" id="progressWrap">
     <div class="progress-label">
-      <span id="progressText"><span class="spinner"></span>Processing…</span>
-      <span id="progressPct"></span>
+      <span id="progressText"><span class="spinner"></span><span id="phaseText">Starting…</span></span>
+      <span id="progressPct">0%</span>
     </div>
     <div class="progress-bar-bg"><div class="progress-bar" id="progressBar"></div></div>
   </div>
@@ -314,17 +338,21 @@ HTML = """<!DOCTYPE html>
   <h3>How it works</h3>
   <div class="steps">
     <div class="step">
-      <span class="step-icon">🔎</span>
-      <span><b>GoFile API</b> — paste your share link and the server auto-extracts the direct video URL.</span>
+      <span class="step-icon">📥</span>
+      <span><b>yt-dlp</b> downloads the video from GoFile — handles authentication, redirects, MOV &amp; MP4 files automatically.</span>
     </div>
     <div class="step">
-      <span class="step-icon">⚡</span>
-      <span><b>Stream → FFmpeg</b> — video is fetched over HTTP and encoded on-the-fly. <b>HD file never stored.</b></span>
+      <span class="step-icon">⚙️</span>
+      <span><b>FFmpeg</b> re-encodes the local file to your chosen quality. No moov-atom or seek errors.</span>
     </div>
     <div class="step">
       <span class="step-icon">⬇️</span>
-      <span><b>Instant download</b> — click the download button once encoding finishes.</span>
+      <span><b>Download</b> the compressed file. Original source is deleted immediately after encoding.</span>
     </div>
+  </div>
+  <div class="tip">
+    <b>Supported inputs:</b> GoFile share links (<code>gofile.io/d/…</code>),
+    direct .mp4 / .mov / .mkv URLs, and most video hosting sites supported by yt-dlp.
   </div>
 </div>
 
@@ -339,34 +367,52 @@ HTML = """<!DOCTYPE html>
   });
 
   let progressInterval = null;
+  let currentPhase = 0; // 0=download, 1=encode
+
+  const PHASES = [
+    { label: '📥 Downloading…',  start: 0,   end: 45,  speed: 1.2 },
+    { label: '⚙️ Encoding…',     start: 45,  end: 95,  speed: 0.5 },
+  ];
+
   function startFakeProgress() {
     let pct = 0;
-    const bar = document.getElementById('progressBar');
-    const pctEl = document.getElementById('progressPct');
+    currentPhase = 0;
+    const bar    = document.getElementById('progressBar');
+    const pctEl  = document.getElementById('progressPct');
+    const phase  = document.getElementById('phaseText');
+
     progressInterval = setInterval(() => {
-      if (pct < 30)      pct += 2.5;
-      else if (pct < 70) pct += 0.8;
-      else if (pct < 88) pct += 0.2;
-      bar.style.width = pct + '%';
-      pctEl.textContent = Math.floor(pct) + '%';
-    }, 400);
+      const p = currentPhase < PHASES.length ? PHASES[currentPhase] : PHASES[PHASES.length-1];
+      if (pct < p.end) {
+        pct += p.speed;
+      } else if (currentPhase < PHASES.length - 1) {
+        currentPhase++;
+      }
+      bar.style.width = Math.min(pct, 98) + '%';
+      pctEl.textContent = Math.floor(Math.min(pct, 98)) + '%';
+      phase.textContent = PHASES[Math.min(currentPhase, PHASES.length-1)].label;
+    }, 500);
   }
+
+  // Advance to encoding phase (called mid-request if we could detect it — here just time-based)
   function stopProgress(final=100) {
     clearInterval(progressInterval);
     document.getElementById('progressBar').style.width = final + '%';
     document.getElementById('progressPct').textContent = final + '%';
+    document.getElementById('phaseText').textContent = final === 100 ? '✅ Done!' : 'Failed';
   }
 
   async function startCompress() {
     const url = document.getElementById('urlInput').value.trim();
-    if (!url) { showError('Please paste a URL above.'); return; }
+    if (!url) { showError('Please paste a GoFile link or video URL above.'); return; }
+
     const btn = document.getElementById('compressBtn');
     btn.disabled = true;
-    btn.textContent = '⚙️ Compressing…';
+    btn.textContent = '⚙️ Processing…';
     document.getElementById('progressWrap').style.display = 'block';
     document.getElementById('result').style.display = 'none';
-    document.getElementById('progressText').innerHTML = '<span class="spinner"></span>Encoding video… (may take a few minutes)';
     startFakeProgress();
+
     try {
       const res  = await fetch('/api/compress', {
         method: 'POST',
@@ -374,7 +420,7 @@ HTML = """<!DOCTYPE html>
         body: JSON.stringify({url, preset: selectedPreset}),
       });
       const data = await res.json();
-      stopProgress(100);
+      stopProgress(res.ok ? 100 : 0);
       res.ok ? showSuccess(data) : showError(data.detail || 'Compression failed.');
     } catch(err) {
       stopProgress(0);
@@ -406,7 +452,8 @@ HTML = """<!DOCTYPE html>
     el.className = 'result error';
     el.style.display = 'block';
     document.getElementById('resultTitle').textContent = '❌ Error';
-    document.getElementById('resultBody').innerHTML = `<div class="error-msg">${msg.replace(/</g,'&lt;')}</div>`;
+    document.getElementById('resultBody').innerHTML =
+      `<div class="error-msg">${msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
   }
 
   document.getElementById('urlInput').addEventListener('keydown', e => {
