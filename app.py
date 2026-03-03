@@ -1,13 +1,7 @@
 """
-Smart Video Compressor v6
-Optimized for Koyeb free tier (0.1 vCPU / 512MB RAM).
-Key changes:
-  - FFmpeg preset: ultrafast (uses ~60% less CPU than veryfast)
-  - Single thread (-threads 1) to stay within 0.1 vCPU
-  - Lower CRF values relaxed slightly for speed
-  - Added niceness (nice -n 10) so the process doesn't starve uvicorn
-  - Chunked download with smaller chunks to reduce memory spikes
-  - Request timeout raised to avoid false 500s on slow encodes
+Smart Video Compressor v7
+Fix: remux pass before encode moves moov atom to front of file.
+This resolves "moov atom not found" on .mov and fragmented .mp4 files.
 """
 import os, re, uuid, time, subprocess, threading, shutil, requests
 from pathlib import Path
@@ -32,12 +26,7 @@ def _cleanup():
                 pass
 threading.Thread(target=_cleanup, daemon=True).start()
 
-# ── Presets — tuned for low-CPU encoding ─────────────────────────────────────
-#
-#  ultrafast preset uses the simplest motion-estimation algorithms.
-#  On 0.1 vCPU it can encode ~2-4x real-time vs ~0.3x for veryfast.
-#  File size is ~15% larger than veryfast at the same CRF — still tiny.
-#
+# ── Presets ───────────────────────────────────────────────────────────────────
 PRESETS = {
     "240p": {"scale": "426:240",  "bitrate": "200k",  "ab": "48k",  "crf": "34"},
     "360p": {"scale": "640:360",  "bitrate": "400k",  "ab": "64k",  "crf": "32"},
@@ -79,7 +68,6 @@ def _resolve_share(url, token):
     raise RuntimeError("No video found in this GoFile share.")
 
 def _dl_cdn(cdn_url, token, dest):
-    """Download with 512KB chunks — lower RAM footprint."""
     with requests.get(cdn_url, stream=True, timeout=600,
                       headers={"User-Agent": _UA, "Referer": "https://gofile.io/"},
                       cookies={"accountToken": token}) as r:
@@ -130,15 +118,43 @@ def smart_download(url, job_dir, job_id):
         return download_gofile(url, job_dir, job_id)
     return download_ytdlp(url, job_dir, job_id)
 
-# ── FFmpeg encode — optimised for 0.1 vCPU ───────────────────────────────────
-def encode(src, preset, out):
+# ── Remux pass ────────────────────────────────────────────────────────────────
+def remux(src: Path, job_dir: Path) -> Path:
+    """
+    Copy streams into a clean MP4 container with moov atom at the front.
+
+    WHY this is needed:
+      .mov files (and some .mp4 from GoFile) store the moov metadata atom
+      at the END of the file. FFmpeg must read the moov before it can decode
+      any frames. When the moov is at the end, FFmpeg reports:
+        "moov atom not found" / "Invalid data found when processing input"
+
+      -movflags +faststart rewrites the output so moov is at the START.
+      -c copy means no re-encoding — this step is near-instant (CPU-free).
+    """
+    remuxed = job_dir / f"{src.stem}_remuxed.mp4"
+    cmd = [
+        "ffmpeg", "-y",
+        "-fflags", "+genpts",        # regenerate PTS if missing
+        "-i", str(src),
+        "-c", "copy",                # no re-encode — just copy streams
+        "-movflags", "+faststart",   # move moov atom to the front
+        str(remuxed),
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0 or not remuxed.exists():
+        # Remux failed — return original and let encode try anyway
+        return src
+    return remuxed
+
+# ── FFmpeg encode ─────────────────────────────────────────────────────────────
+def encode(src: str, preset: str, out: str):
     p = PRESETS[preset]
     vf = (
         f"scale={p['scale']}:force_original_aspect_ratio=decrease,"
         f"pad={p['scale']}:(ow-iw)/2:(oh-ih)/2"
     )
     cmd = [
-        # nice -n 19 = lowest priority, won't starve uvicorn
         "nice", "-n", "19",
         "ffmpeg", "-y",
         "-i", src,
@@ -146,19 +162,19 @@ def encode(src, preset, out):
         "-c:v", "libx264",
         "-b:v", p["bitrate"],
         "-crf", p["crf"],
-        "-preset", "ultrafast",   # ← was veryfast, saves ~60% CPU
-        "-tune",   "fastdecode",  # ← optimise for decode speed too
+        "-preset", "ultrafast",
+        "-tune", "fastdecode",
         "-c:a", "aac",
         "-b:a", p["ab"],
         "-movflags", "+faststart",
-        "-threads", "1",          # ← single thread for 0.1 vCPU
+        "-threads", "1",
         out,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=7200)
     if result.returncode != 0:
         raise RuntimeError(result.stderr[-3000:])
 
-# ── API models ────────────────────────────────────────────────────────────────
+# ── API ───────────────────────────────────────────────────────────────────────
 class CompressRequest(BaseModel):
     url:    str
     preset: str = "360p"
@@ -171,7 +187,6 @@ class CompressResponse(BaseModel):
     saved_pct:   float
     elapsed_sec: float
 
-# ── Routes ────────────────────────────────────────────────────────────────────
 @app.post("/api/compress", response_model=CompressResponse)
 def compress(req: CompressRequest):
     if req.preset not in PRESETS:
@@ -186,14 +201,22 @@ def compress(req: CompressRequest):
     t0 = time.time()
 
     try:
+        # 1. Download
         try:
             src = smart_download(url, job_dir, job_id)
         except Exception as e:
             raise HTTPException(500, f"Download failed: {e}")
 
         orig_bytes = src.stat().st_size
+
+        # 2. Remux — fixes moov atom position for .mov and fragmented mp4
+        src = remux(src, job_dir)
+
+        # 3. Encode
         base = re.sub(r"[^\w._-]", "_",
-                      re.sub(r"\.[^.]+$", "", src.name)).strip("_")[:60] or "video"
+                      re.sub(r"\.[^.]+$", "", src.stem)).strip("_")[:60] or "video"
+        # strip _remuxed suffix from output filename
+        base = base.replace("_remuxed", "")
         outname = f"{base}_{req.preset}.mp4"
         outpath = str(WORK_DIR / outname)
 
@@ -295,8 +318,8 @@ HTML = """<!DOCTYPE html>
     border-top-color:var(--accent);border-radius:50%;animation:spin .7s linear infinite;
     vertical-align:middle;margin-right:6px}
   @keyframes spin{to{transform:rotate(360deg)}}
-  .warning-box{margin-top:14px;padding:11px 14px;border-radius:10px;font-size:.82rem;line-height:1.6;
-    background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);color:#fcd34d;display:none}
+  .warning-box{display:none;margin-top:14px;padding:11px 14px;border-radius:10px;font-size:.82rem;
+    line-height:1.6;background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.2);color:#fcd34d}
   .result{display:none;margin-top:22px;background:var(--bg);border:1px solid var(--border);
     border-radius:12px;padding:20px}
   .result.success{border-color:rgba(34,197,94,.35)}
@@ -355,7 +378,7 @@ HTML = """<!DOCTYPE html>
 
   <div class="warning-box" id="warningBox">
     ⏳ <b>This may take several minutes</b> on the free server (0.1 vCPU).<br>
-    The page will update automatically when done — don't close it.
+    The page will update when done — don't close it.
   </div>
 
   <div class="progress-wrap" id="progressWrap">
@@ -375,16 +398,15 @@ HTML = """<!DOCTYPE html>
 <div class="how">
   <h3>How it works</h3>
   <div class="steps">
-    <div class="step"><span>🔑</span>
-      <span><b>GoFile API</b> — server gets a guest token, resolves the link, downloads directly. No yt-dlp rate-limiting.</span></div>
+    <div class="step"><span>📥</span>
+      <span><b>Download</b> — GoFile API resolves the link with a guest token and downloads the file.</span></div>
+    <div class="step"><span>🔧</span>
+      <span><b>Remux</b> — FFmpeg copies streams into a clean MP4, moving the moov atom to the front. Fixes .mov files instantly.</span></div>
     <div class="step"><span>⚙️</span>
-      <span><b>FFmpeg ultrafast</b> — uses the fastest encoding preset to stay within the free server's 0.1 vCPU limit.</span></div>
-    <div class="step"><span>⬇️</span>
-      <span><b>Download</b> the compressed video. Source file deleted immediately. Output expires after 1 hour.</span></div>
+      <span><b>Encode</b> — FFmpeg ultrafast re-encodes to your chosen quality at minimum CPU cost.</span></div>
   </div>
   <div class="cpu-note">
-    <b>Free tier limits:</b> Encoding a 100MB video at 360p takes ~3–8 minutes on 0.1 vCPU.
-    For faster results, keep files under 200MB or use 240p/360p presets.
+    <b>Free tier:</b> Encoding ~100MB at 360p takes 3–8 min on 0.1 vCPU. Keep files under 300MB or use 240p for best speed.
   </div>
 </div>
 
@@ -403,81 +425,75 @@ HTML = """<!DOCTYPE html>
     val = val.trim();
     if (!val) { hint.className='url-hint other'; hint.textContent='Paste a GoFile URL above'; return; }
     if (/gofile\.io\/(?:d\/|\?c=)/.test(val)) {
-      hint.className='url-hint share';
-      hint.textContent='✅ GoFile share link — best option';
+      hint.className='url-hint share'; hint.textContent='✅ GoFile share link — best option';
     } else if (/[\w-]+\.gofile\.io\//.test(val)) {
-      hint.className='url-hint cdn';
-      hint.textContent='⚡ GoFile CDN URL — downloaded with guest token';
+      hint.className='url-hint cdn'; hint.textContent='⚡ GoFile CDN URL — downloaded with guest token';
     } else {
-      hint.className='url-hint other';
-      hint.textContent='🔗 External URL — handled by yt-dlp';
+      hint.className='url-hint other'; hint.textContent='🔗 External URL — handled by yt-dlp';
     }
   }
 
-  let progressInterval = null, pct = 0, phaseIdx = 0;
-  // Slower animation to match real encode time on 0.1 vCPU
-  const PHASES = [
-    {label:'📥 Downloading from GoFile…', end:30, speed:0.6},
-    {label:'⚙️ Encoding (ultrafast)…',    end:93, speed:0.18},
+  let progressInterval=null, pct=0, phaseIdx=0;
+  const PHASES=[
+    {label:'📥 Downloading…',       end:25, speed:0.7},
+    {label:'🔧 Remuxing container…', end:35, speed:1.5},
+    {label:'⚙️ Encoding (ultrafast)…', end:93, speed:0.18},
   ];
 
   function startFakeProgress() {
-    pct = 0; phaseIdx = 0;
-    const bar   = document.getElementById('progressBar');
-    const pctEl = document.getElementById('progressPct');
-    const phase = document.getElementById('phaseText');
-    progressInterval = setInterval(() => {
-      const p = PHASES[Math.min(phaseIdx, PHASES.length-1)];
-      if (pct < p.end) { pct += p.speed; }
-      else if (phaseIdx < PHASES.length - 1) { phaseIdx++; }
-      bar.style.width  = Math.min(pct, 93) + '%';
-      pctEl.textContent = Math.floor(Math.min(pct, 93)) + '%';
-      phase.textContent = PHASES[Math.min(phaseIdx, PHASES.length-1)].label;
-    }, 600);
+    pct=0; phaseIdx=0;
+    const bar=document.getElementById('progressBar');
+    const pctEl=document.getElementById('progressPct');
+    const phase=document.getElementById('phaseText');
+    progressInterval=setInterval(()=>{
+      const p=PHASES[Math.min(phaseIdx,PHASES.length-1)];
+      if(pct<p.end){pct+=p.speed;}
+      else if(phaseIdx<PHASES.length-1){phaseIdx++;}
+      bar.style.width=Math.min(pct,93)+'%';
+      pctEl.textContent=Math.floor(Math.min(pct,93))+'%';
+      phase.textContent=PHASES[Math.min(phaseIdx,PHASES.length-1)].label;
+    },600);
   }
 
-  function stopProgress(final=100) {
+  function stopProgress(final=100){
     clearInterval(progressInterval);
-    document.getElementById('progressBar').style.width = final + '%';
-    document.getElementById('progressPct').textContent = final + '%';
-    document.getElementById('phaseText').textContent = final === 100 ? '✅ Done!' : '❌ Failed';
+    document.getElementById('progressBar').style.width=final+'%';
+    document.getElementById('progressPct').textContent=final+'%';
+    document.getElementById('phaseText').textContent=final===100?'✅ Done!':'❌ Failed';
   }
 
-  async function startCompress() {
-    const url = document.getElementById('urlInput').value.trim();
-    if (!url) { showError('Please paste a URL above.'); return; }
-    const btn = document.getElementById('compressBtn');
-    btn.disabled = true;
-    btn.textContent = '⚙️ Processing…';
-    document.getElementById('progressWrap').style.display = 'block';
-    document.getElementById('warningBox').style.display   = 'block';
-    document.getElementById('result').style.display       = 'none';
+  async function startCompress(){
+    const url=document.getElementById('urlInput').value.trim();
+    if(!url){showError('Please paste a URL above.');return;}
+    const btn=document.getElementById('compressBtn');
+    btn.disabled=true; btn.textContent='⚙️ Processing…';
+    document.getElementById('progressWrap').style.display='block';
+    document.getElementById('warningBox').style.display='block';
+    document.getElementById('result').style.display='none';
     startFakeProgress();
-    try {
-      const res  = await fetch('/api/compress', {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({url, preset: selectedPreset}),
+    try{
+      const res=await fetch('/api/compress',{
+        method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({url,preset:selectedPreset}),
       });
-      const data = await res.json();
-      stopProgress(res.ok ? 100 : 0);
-      document.getElementById('warningBox').style.display = 'none';
-      res.ok ? showSuccess(data) : showError(data.detail || 'Compression failed.');
-    } catch(err) {
+      const data=await res.json();
+      stopProgress(res.ok?100:0);
+      document.getElementById('warningBox').style.display='none';
+      res.ok?showSuccess(data):showError(data.detail||'Compression failed.');
+    }catch(err){
       stopProgress(0);
-      document.getElementById('warningBox').style.display = 'none';
-      showError('Network error: ' + err.message);
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '🚀 Compress Video';
+      document.getElementById('warningBox').style.display='none';
+      showError('Network error: '+err.message);
+    }finally{
+      btn.disabled=false; btn.textContent='🚀 Compress Video';
     }
   }
 
-  function showSuccess(d) {
-    const el = document.getElementById('result');
-    el.className = 'result success'; el.style.display = 'block';
-    document.getElementById('resultTitle').textContent = '✅ Done in ' + d.elapsed_sec + 's';
-    document.getElementById('resultBody').innerHTML = `
+  function showSuccess(d){
+    const el=document.getElementById('result');
+    el.className='result success'; el.style.display='block';
+    document.getElementById('resultTitle').textContent='✅ Done in '+d.elapsed_sec+'s';
+    document.getElementById('resultBody').innerHTML=`
       <div class="stats">
         <div class="stat"><div class="stat-val">${d.orig_mb} MB</div><div class="stat-label">Original</div></div>
         <div class="stat"><div class="stat-val">${d.comp_mb} MB</div><div class="stat-label">Compressed</div></div>
@@ -488,16 +504,16 @@ HTML = """<!DOCTYPE html>
       </a>`;
   }
 
-  function showError(msg) {
-    const el = document.getElementById('result');
-    el.className = 'result error'; el.style.display = 'block';
-    document.getElementById('resultTitle').textContent = '❌ Error';
-    document.getElementById('resultBody').innerHTML =
+  function showError(msg){
+    const el=document.getElementById('result');
+    el.className='result error'; el.style.display='block';
+    document.getElementById('resultTitle').textContent='❌ Error';
+    document.getElementById('resultBody').innerHTML=
       `<div class="error-msg">${msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
   }
 
-  document.getElementById('urlInput').addEventListener('keydown', e => {
-    if (e.key === 'Enter') startCompress();
+  document.getElementById('urlInput').addEventListener('keydown',e=>{
+    if(e.key==='Enter')startCompress();
   });
 </script>
 </body>
