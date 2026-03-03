@@ -1,6 +1,5 @@
 FROM python:3.11-slim
 
-# Install FFmpeg
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg && \
     apt-get clean && \
@@ -8,15 +7,11 @@ RUN apt-get update && \
 
 WORKDIR /app
 
-# Install Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy app
 COPY app.py .
-COPY static/ ./static/
 
-# Koyeb injects $PORT at runtime (default 8000)
 ENV PORT=8000
 EXPOSE 8000
 
