@@ -1,7 +1,8 @@
 """
-Smart Video Compressor v8
-Fix: fetch GoFile website token dynamically instead of hardcoding it.
-The wt= parameter expires — we pull it fresh from GoFile's JS bundle each time.
+Smart Video Compressor v9
+GoFile API fixes based on their early-2026 changes:
+  - websiteToken now fetched from /dist/js/alljs.js (not global.js)
+  - Token passed as X-Website-Token header (not wt= query param)
 """
 import os, re, uuid, time, subprocess, threading, shutil, requests
 from pathlib import Path
@@ -32,72 +33,79 @@ PRESETS = {
     "720p": {"scale": "1280:720", "bitrate": "1600k", "ab": "128k", "crf": "28"},
 }
 
-_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
 
-# ── GoFile: dynamic website token ─────────────────────────────────────────────
-_cached_wt = None
+# ── GoFile website token (fetched from their JS bundle) ───────────────────────
+_cached_wt      = None
 _cached_wt_time = 0
-_WT_TTL = 3600  # re-fetch every hour
+_WT_TTL         = 1800  # re-fetch every 30 min
 
-def _get_website_token() -> str:
+def _fetch_website_token() -> str:
     """
-    Fetch the current GoFile website token from their JS bundle.
-    GoFile embeds it as `websiteToken = "xxxx"` in their global JS file.
-    We cache it for 1 hour so we don't hammer their CDN.
+    GoFile embeds websiteToken in their JS bundle.
+    As of early 2026 the file is /dist/js/alljs.js (global.js returns 404).
+    Regex matches both assignment styles:
+      websiteToken = "abc123"
+      websiteToken: "abc123"
     """
-    global _cached_wt, _cached_wt_time
-    if _cached_wt and (time.time() - _cached_wt_time) < _WT_TTL:
-        return _cached_wt
-
     s = requests.Session()
     s.headers["User-Agent"] = _UA
 
-    # Strategy 1: fetch global.js directly
-    try:
-        r = s.get("https://gofile.io/dist/js/global.js", timeout=10)
-        if r.status_code == 200:
-            m = re.search(r'websiteToken\s*[=:]\s*["\']([a-zA-Z0-9]+)["\']', r.text)
-            if m:
-                _cached_wt = m.group(1)
-                _cached_wt_time = time.time()
-                return _cached_wt
-    except Exception:
-        pass
+    candidates = [
+        "https://gofile.io/dist/js/alljs.js",
+        "https://gofile.io/dist/js/global.js",   # legacy fallback
+        "https://gofile.io/dist/js/index.js",
+    ]
+    pattern = re.compile(r'websiteToken\s*[=:]\s*["\']([a-zA-Z0-9]+)["\']')
 
-    # Strategy 2: scrape the GoFile homepage for JS bundle URL, then search that
+    for url in candidates:
+        try:
+            r = s.get(url, timeout=10)
+            if r.status_code == 200:
+                m = pattern.search(r.text)
+                if m:
+                    return m.group(1)
+        except Exception:
+            continue
+
+    # Scrape homepage and try every linked JS file
     try:
         home = s.get("https://gofile.io/", timeout=10)
         js_urls = re.findall(r'src=["\']([^"\']*\.js[^"\']*)["\']', home.text)
-        for js_url in js_urls:
-            if not js_url.startswith("http"):
-                js_url = "https://gofile.io" + js_url
+        for js_path in js_urls:
+            js_url = js_path if js_path.startswith("http") else f"https://gofile.io{js_path}"
             try:
                 jr = s.get(js_url, timeout=10)
-                m = re.search(r'websiteToken\s*[=:]\s*["\']([a-zA-Z0-9]+)["\']', jr.text)
+                m = pattern.search(jr.text)
                 if m:
-                    _cached_wt = m.group(1)
-                    _cached_wt_time = time.time()
-                    return _cached_wt
+                    return m.group(1)
             except Exception:
                 continue
     except Exception:
         pass
 
-    # Strategy 3: known fallback tokens to try in order
-    fallbacks = ["4fd6sg89d7s6", "7bnjuta0b4s6", "2dlpba1ldkes"]
-    for wt in fallbacks:
-        _cached_wt = wt
-        _cached_wt_time = time.time()
-        return wt  # will be validated when we actually call the API
+    # Last resort: known working token (may expire, but better than nothing)
+    return "4fd6sg89d7s6"
 
-    raise RuntimeError("Could not obtain GoFile website token.")
+def get_website_token() -> str:
+    global _cached_wt, _cached_wt_time
+    if _cached_wt and (time.time() - _cached_wt_time) < _WT_TTL:
+        return _cached_wt
+    _cached_wt = _fetch_website_token()
+    _cached_wt_time = time.time()
+    return _cached_wt
 
-# ── GoFile guest token ────────────────────────────────────────────────────────
-def _get_account_token() -> str:
+def invalidate_website_token():
+    global _cached_wt, _cached_wt_time
+    _cached_wt = None
+    _cached_wt_time = 0
+
+# ── GoFile account token (guest) ─────────────────────────────────────────────
+def get_account_token() -> str:
     r = requests.post(
         "https://api.gofile.io/accounts",
         headers={"User-Agent": _UA},
-        timeout=15
+        timeout=15,
     )
     r.raise_for_status()
     d = r.json()
@@ -105,77 +113,87 @@ def _get_account_token() -> str:
         raise RuntimeError(f"GoFile account error: {d}")
     return d["data"]["token"]
 
-# ── Resolve GoFile share link → CDN URL ───────────────────────────────────────
-def _resolve_share(cid: str, account_token: str, website_token: str) -> tuple:
-    s = requests.Session()
-    s.headers.update({"User-Agent": _UA, "Referer": "https://gofile.io/"})
-    s.cookies.set("accountToken", account_token)
-
-    r = s.get(
+# ── Resolve share link → CDN URL ──────────────────────────────────────────────
+def _call_contents_api(cid: str, account_token: str, website_token: str) -> dict:
+    """
+    Call GoFile contents API.
+    NEW: website token goes in X-Website-Token header, NOT wt= query param.
+    """
+    r = requests.get(
         f"https://api.gofile.io/contents/{cid}",
-        params={"token": account_token, "wt": website_token},
-        timeout=15
+        params={"token": account_token},
+        headers={
+            "User-Agent":      _UA,
+            "Referer":         "https://gofile.io/",
+            "X-Website-Token": website_token,   # ← new header-based auth
+        },
+        cookies={"accountToken": account_token},
+        timeout=15,
     )
+    return r
 
-    # If 401, our website token may be stale — invalidate cache and retry once
+def resolve_share(url: str, account_token: str) -> tuple:
+    m = re.search(r"gofile\.io/(?:d/|\?c=)([A-Za-z0-9]+)", url)
+    if not m:
+        raise ValueError("Cannot parse GoFile content ID from URL.")
+    cid = m.group(1)
+
+    wt = get_website_token()
+    r  = _call_contents_api(cid, account_token, wt)
+
+    # 401 → stale website token → retry once with fresh token
     if r.status_code == 401:
-        global _cached_wt, _cached_wt_time
-        _cached_wt = None
-        _cached_wt_time = 0
-        new_wt = _get_website_token()
-        r = s.get(
-            f"https://api.gofile.io/contents/{cid}",
-            params={"token": account_token, "wt": new_wt},
-            timeout=15
-        )
+        invalidate_website_token()
+        wt = get_website_token()
+        r  = _call_contents_api(cid, account_token, wt)
 
     r.raise_for_status()
     data = r.json()
+
     if data.get("status") != "ok":
         raise RuntimeError(f"GoFile API error: {data}")
 
     children = data["data"].get("children", {})
 
-    # prefer video files
+    # prefer video
     for child in children.values():
         if child.get("type") == "file" and child.get("mimetype", "").startswith("video"):
-            return child["link"], child.get("name", "video.mp4"), account_token
-    # fallback: any file
+            return child["link"], child.get("name", "video.mp4")
+    # any file
     for child in children.values():
         if child.get("type") == "file":
-            return child["link"], child.get("name", "file"), account_token
+            return child["link"], child.get("name", "file")
 
-    raise RuntimeError("No video file found in this GoFile share.")
+    raise RuntimeError("No video found in this GoFile share.")
 
-# ── Download CDN file ─────────────────────────────────────────────────────────
-def _download_cdn(cdn_url: str, account_token: str, dest: Path):
-    s = requests.Session()
-    s.headers.update({"User-Agent": _UA, "Referer": "https://gofile.io/"})
-    s.cookies.set("accountToken", account_token)
-
-    with s.get(cdn_url, stream=True, timeout=600) as r:
+# ── CDN download ──────────────────────────────────────────────────────────────
+def download_cdn(cdn_url: str, account_token: str, dest: Path):
+    wt = get_website_token()
+    with requests.get(
+        cdn_url, stream=True, timeout=600,
+        headers={
+            "User-Agent":      _UA,
+            "Referer":         "https://gofile.io/",
+            "X-Website-Token": wt,
+        },
+        cookies={"accountToken": account_token},
+    ) as r:
         if r.status_code == 401:
-            raise RuntimeError("GoFile CDN 401: Link expired or file is password-protected.")
+            raise RuntimeError("GoFile CDN 401: link expired or file is password-protected.")
         if r.status_code == 429:
-            raise RuntimeError("GoFile 429: Rate limited — wait a minute and try again.")
+            raise RuntimeError("GoFile 429: rate limited — wait a minute and try again.")
         r.raise_for_status()
         with open(dest, "wb") as f:
             for chunk in r.iter_content(512 * 1024):
                 if chunk:
                     f.write(chunk)
 
-# ── Main GoFile download entry point ─────────────────────────────────────────
+# ── GoFile full download pipeline ─────────────────────────────────────────────
 def download_gofile(url: str, job_dir: Path, job_id: str) -> Path:
-    account_token = _get_account_token()
-    website_token = _get_website_token()
+    account_token = get_account_token()
 
     if re.search(r"gofile\.io/(?:d/|\?c=)", url):
-        # Share link — resolve via API
-        m = re.search(r"gofile\.io/(?:d/|\?c=)([A-Za-z0-9]+)", url)
-        if not m:
-            raise ValueError("Cannot parse GoFile content ID.")
-        cid = m.group(1)
-        cdn_url, fname, account_token = _resolve_share(cid, account_token, website_token)
+        cdn_url, fname = resolve_share(url, account_token)
     else:
         # Direct CDN URL
         fname   = url.split("?")[0].rstrip("/").split("/")[-1] or "video.mp4"
@@ -183,20 +201,20 @@ def download_gofile(url: str, job_dir: Path, job_id: str) -> Path:
 
     safe = re.sub(r"[^\w._-]", "_", fname).strip("_") or f"video_{job_id}"
     dest = job_dir / f"src_{job_id}_{safe}"
-    _download_cdn(cdn_url, account_token, dest)
+    download_cdn(cdn_url, account_token, dest)
 
     if not dest.exists() or dest.stat().st_size == 0:
-        raise RuntimeError("Downloaded file is empty — the link may have expired.")
+        raise RuntimeError("Downloaded file is empty — link may have expired.")
     return dest
 
-# ── yt-dlp (non-GoFile URLs) ──────────────────────────────────────────────────
+# ── yt-dlp (non-GoFile) ───────────────────────────────────────────────────────
 def download_ytdlp(url: str, job_dir: Path, job_id: str) -> Path:
     tpl = str(job_dir / f"src_{job_id}.%(ext)s")
     r = subprocess.run(
         ["yt-dlp", "--no-playlist", "--no-warnings",
          "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best",
          "--merge-output-format", "mp4", "-o", tpl, url],
-        capture_output=True, text=True, timeout=600
+        capture_output=True, text=True, timeout=600,
     )
     if r.returncode != 0:
         raise RuntimeError(f"yt-dlp: {r.stderr[-2000:]}")
@@ -214,20 +232,16 @@ def smart_download(url: str, job_dir: Path, job_id: str) -> Path:
         return download_gofile(url, job_dir, job_id)
     return download_ytdlp(url, job_dir, job_id)
 
-# ── Remux: fix moov atom before encoding ─────────────────────────────────────
+# ── Remux (fix moov atom) ─────────────────────────────────────────────────────
 def remux(src: Path, job_dir: Path) -> Path:
-    remuxed = job_dir / f"{src.stem}_rx.mp4"
+    out = job_dir / f"{src.stem}_rx.mp4"
     r = subprocess.run([
-        "ffmpeg", "-y",
-        "-fflags", "+genpts",
-        "-i", str(src),
-        "-c", "copy",
-        "-movflags", "+faststart",
-        str(remuxed),
+        "ffmpeg", "-y", "-fflags", "+genpts",
+        "-i", str(src), "-c", "copy", "-movflags", "+faststart", str(out),
     ], capture_output=True, text=True, timeout=300)
-    if r.returncode == 0 and remuxed.exists() and remuxed.stat().st_size > 0:
-        return remuxed
-    return src  # remux failed — pass original and hope for the best
+    if r.returncode == 0 and out.exists() and out.stat().st_size > 0:
+        return out
+    return src
 
 # ── FFmpeg encode ─────────────────────────────────────────────────────────────
 def encode(src: str, preset: str, out: str):
@@ -237,15 +251,13 @@ def encode(src: str, preset: str, out: str):
         f"pad={p['scale']}:(ow-iw)/2:(oh-ih)/2"
     )
     r = subprocess.run([
-        "nice", "-n", "19",
-        "ffmpeg", "-y",
+        "nice", "-n", "19", "ffmpeg", "-y",
         "-i", src,
         "-vf", vf,
         "-c:v", "libx264", "-b:v", p["bitrate"], "-crf", p["crf"],
         "-preset", "ultrafast", "-tune", "fastdecode",
         "-c:a", "aac", "-b:a", p["ab"],
-        "-movflags", "+faststart",
-        "-threads", "1",
+        "-movflags", "+faststart", "-threads", "1",
         out,
     ], capture_output=True, text=True, timeout=7200)
     if r.returncode != 0:
@@ -263,7 +275,7 @@ class CompressResponse(BaseModel):
 @app.post("/api/compress", response_model=CompressResponse)
 def compress(req: CompressRequest):
     if req.preset not in PRESETS:
-        raise HTTPException(400, f"Unknown preset. Choose from: {list(PRESETS)}")
+        raise HTTPException(400, f"Unknown preset. Choose: {list(PRESETS)}")
     url = req.url.strip()
     if not url:
         raise HTTPException(400, "URL required.")
@@ -304,17 +316,17 @@ def compress(req: CompressRequest):
 
     return CompressResponse(
         job_id=job_id, filename=outname,
-        orig_mb=round(orig_mb, 2), comp_mb=round(comp_mb, 2),
-        saved_pct=saved_pct, elapsed_sec=round(elapsed, 1),
+        orig_mb=round(orig_mb,2), comp_mb=round(comp_mb,2),
+        saved_pct=saved_pct, elapsed_sec=round(elapsed,1),
     )
 
 @app.get("/api/download/{filename}")
 def download(filename: str):
     if "/" in filename or ".." in filename:
-        raise HTTPException(400, "Invalid filename.")
+        raise HTTPException(400, "Invalid.")
     path = WORK_DIR / filename
     if not path.exists():
-        raise HTTPException(404, "File not found or expired.")
+        raise HTTPException(404, "Expired.")
     return FileResponse(str(path), media_type="video/mp4", filename=filename,
                         headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
@@ -351,8 +363,7 @@ HTML = """<!DOCTYPE html>
   label{display:block;font-size:.8rem;font-weight:600;color:var(--muted);
         text-transform:uppercase;letter-spacing:.6px;margin-bottom:8px}
   input[type=text]{width:100%;background:var(--bg);border:1px solid var(--border);
-    border-radius:10px;color:var(--text);font-size:.95rem;padding:12px 16px;
-    outline:none;transition:border-color .2s}
+    border-radius:10px;color:var(--text);font-size:.95rem;padding:12px 16px;outline:none;transition:border-color .2s}
   input[type=text]:focus{border-color:var(--accent)}
   input::placeholder{color:var(--muted)}
   .field{margin-bottom:18px}
@@ -413,11 +424,11 @@ HTML = """<!DOCTYPE html>
 <div class="header">
   <h1>🎬 Smart Video Compressor</h1>
   <p>Paste a GoFile link — get a compressed video back.</p>
-  <span class="badge">✦ GoFile API + FFmpeg ultrafast</span>
+  <span class="badge">✦ GoFile API v2026 + FFmpeg</span>
 </div>
 <div class="card">
   <div class="field">
-    <label>GoFile Share Link or Direct CDN URL</label>
+    <label>GoFile Share Link</label>
     <input type="text" id="urlInput" oninput="detectUrl(this.value)"
            placeholder="https://gofile.io/d/XXXXXX"/>
     <div class="url-hint other" id="urlHint">Paste a GoFile URL above</div>
@@ -430,9 +441,7 @@ HTML = """<!DOCTYPE html>
     <button class="preset-btn" data-preset="720p"><div class="res">720p</div><div class="save">~50% off</div></button>
   </div>
   <button class="btn" id="compressBtn" onclick="startCompress()">🚀 Compress Video</button>
-  <div class="warning-box" id="warningBox">
-    ⏳ <b>Processing…</b> This can take several minutes on the free server. Don't close the page.
-  </div>
+  <div class="warning-box" id="warningBox">⏳ <b>Processing…</b> Don't close this page. May take a few minutes.</div>
   <div class="progress-wrap" id="progressWrap">
     <div class="progress-label">
       <span><span class="spinner"></span><span id="phaseText">Starting…</span></span>
@@ -448,84 +457,55 @@ HTML = """<!DOCTYPE html>
 <div class="how">
   <h3>How it works</h3>
   <div class="steps">
-    <div class="step"><span>🔑</span><span><b>Dynamic token</b> — fetches GoFile's current website token from their JS bundle automatically. Never goes stale.</span></div>
-    <div class="step"><span>📥</span><span><b>Download</b> — resolves the share link and downloads with auth cookie.</span></div>
-    <div class="step"><span>🔧</span><span><b>Remux + Encode</b> — fixes moov atom, then encodes to your chosen quality.</span></div>
+    <div class="step"><span>🔑</span><span><b>Token</b> — fetches GoFile's current website token from <code>alljs.js</code>, passed as <code>X-Website-Token</code> header.</span></div>
+    <div class="step"><span>📥</span><span><b>Download</b> — resolves share link via GoFile API and downloads the video.</span></div>
+    <div class="step"><span>⚙️</span><span><b>Remux + Encode</b> — fixes moov atom, then compresses to your chosen quality.</span></div>
   </div>
   <div class="cpu-note"><b>Free tier:</b> ~3–8 min per 100MB on 0.1 vCPU. Use 240p or 360p for fastest results.</div>
 </div>
 <script>
-  let selectedPreset='360p';
-  document.querySelectorAll('.preset-btn').forEach(btn=>{
-    btn.addEventListener('click',()=>{
-      document.querySelectorAll('.preset-btn').forEach(b=>b.classList.remove('active'));
-      btn.classList.add('active'); selectedPreset=btn.dataset.preset;
-    });
+  let sel='360p';
+  document.querySelectorAll('.preset-btn').forEach(b=>{
+    b.addEventListener('click',()=>{document.querySelectorAll('.preset-btn').forEach(x=>x.classList.remove('active'));b.classList.add('active');sel=b.dataset.preset;});
   });
-  function detectUrl(val){
-    const hint=document.getElementById('urlHint'); val=val.trim();
-    if(!val){hint.className='url-hint other';hint.textContent='Paste a GoFile URL above';return;}
-    if(/gofile\.io\/(?:d\/|\?c=)/.test(val)){hint.className='url-hint share';hint.textContent='✅ GoFile share link — best option';}
-    else if(/[\w-]+\.gofile\.io\//.test(val)){hint.className='url-hint cdn';hint.textContent='⚡ GoFile CDN URL';}
-    else{hint.className='url-hint other';hint.textContent='🔗 External URL — yt-dlp';}
+  function detectUrl(v){
+    const h=document.getElementById('urlHint');v=v.trim();
+    if(!v){h.className='url-hint other';h.textContent='Paste a GoFile URL above';return;}
+    if(/gofile\.io\/(?:d\/|\?c=)/.test(v)){h.className='url-hint share';h.textContent='✅ GoFile share link';}
+    else if(/[\w-]+\.gofile\.io\//.test(v)){h.className='url-hint cdn';h.textContent='⚡ GoFile CDN URL';}
+    else{h.className='url-hint other';h.textContent='🔗 External URL';}
   }
-  let progressInterval=null,pct=0,phaseIdx=0;
-  const PHASES=[
-    {label:'🔑 Getting GoFile token…',   end:10, speed:1.5},
-    {label:'📥 Downloading…',             end:30, speed:0.6},
-    {label:'🔧 Remuxing container…',      end:38, speed:1.2},
-    {label:'⚙️ Encoding (ultrafast)…',   end:93, speed:0.18},
-  ];
-  function startFakeProgress(){
-    pct=0;phaseIdx=0;
-    const bar=document.getElementById('progressBar'),pctEl=document.getElementById('progressPct'),phase=document.getElementById('phaseText');
-    progressInterval=setInterval(()=>{
-      const p=PHASES[Math.min(phaseIdx,PHASES.length-1)];
-      if(pct<p.end){pct+=p.speed;}else if(phaseIdx<PHASES.length-1){phaseIdx++;}
-      bar.style.width=Math.min(pct,93)+'%';pctEl.textContent=Math.floor(Math.min(pct,93))+'%';
-      phase.textContent=PHASES[Math.min(phaseIdx,PHASES.length-1)].label;
-    },600);
-  }
-  function stopProgress(final=100){
-    clearInterval(progressInterval);
-    document.getElementById('progressBar').style.width=final+'%';
-    document.getElementById('progressPct').textContent=final+'%';
-    document.getElementById('phaseText').textContent=final===100?'✅ Done!':'❌ Failed';
-  }
+  let pInt=null,pct=0,pi=0;
+  const PH=[{l:'🔑 Fetching website token…',e:8,s:1.5},{l:'📥 Downloading…',e:35,s:0.6},{l:'🔧 Remuxing…',e:42,s:1.2},{l:'⚙️ Encoding…',e:93,s:0.18}];
+  function startP(){pct=0;pi=0;const b=document.getElementById('progressBar'),p=document.getElementById('progressPct'),t=document.getElementById('phaseText');
+    pInt=setInterval(()=>{const ph=PH[Math.min(pi,PH.length-1)];if(pct<ph.e){pct+=ph.s;}else if(pi<PH.length-1){pi++;}
+    b.style.width=Math.min(pct,93)+'%';p.textContent=Math.floor(Math.min(pct,93))+'%';t.textContent=PH[Math.min(pi,PH.length-1)].l;},600);}
+  function stopP(f=100){clearInterval(pInt);document.getElementById('progressBar').style.width=f+'%';document.getElementById('progressPct').textContent=f+'%';document.getElementById('phaseText').textContent=f===100?'✅ Done!':'❌ Failed';}
   async function startCompress(){
     const url=document.getElementById('urlInput').value.trim();
-    if(!url){showError('Please paste a URL above.');return;}
-    const btn=document.getElementById('compressBtn');
-    btn.disabled=true;btn.textContent='⚙️ Processing…';
+    if(!url){showErr('Please paste a GoFile URL.');return;}
+    const btn=document.getElementById('compressBtn');btn.disabled=true;btn.textContent='⚙️ Processing…';
     document.getElementById('progressWrap').style.display='block';
     document.getElementById('warningBox').style.display='block';
     document.getElementById('result').style.display='none';
-    startFakeProgress();
+    startP();
     try{
-      const res=await fetch('/api/compress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,preset:selectedPreset})});
-      const data=await res.json();
-      stopProgress(res.ok?100:0);
-      document.getElementById('warningBox').style.display='none';
-      res.ok?showSuccess(data):showError(data.detail||'Compression failed.');
-    }catch(err){stopProgress(0);document.getElementById('warningBox').style.display='none';showError('Network error: '+err.message);}
+      const res=await fetch('/api/compress',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({url,preset:sel})});
+      const d=await res.json();stopP(res.ok?100:0);document.getElementById('warningBox').style.display='none';
+      res.ok?showOk(d):showErr(d.detail||'Compression failed.');
+    }catch(e){stopP(0);document.getElementById('warningBox').style.display='none';showErr('Network error: '+e.message);}
     finally{btn.disabled=false;btn.textContent='🚀 Compress Video';}
   }
-  function showSuccess(d){
-    const el=document.getElementById('result');el.className='result success';el.style.display='block';
+  function showOk(d){const el=document.getElementById('result');el.className='result success';el.style.display='block';
     document.getElementById('resultTitle').textContent='✅ Done in '+d.elapsed_sec+'s';
-    document.getElementById('resultBody').innerHTML=`
-      <div class="stats">
-        <div class="stat"><div class="stat-val">${d.orig_mb} MB</div><div class="stat-label">Original</div></div>
-        <div class="stat"><div class="stat-val">${d.comp_mb} MB</div><div class="stat-label">Compressed</div></div>
-        <div class="stat"><div class="stat-val green">${d.saved_pct}% off</div><div class="stat-label">Saved</div></div>
-      </div>
-      <a class="dl-btn" href="/api/download/${encodeURIComponent(d.filename)}" download>⬇️ Download ${d.filename}</a>`;
-  }
-  function showError(msg){
-    const el=document.getElementById('result');el.className='result error';el.style.display='block';
+    document.getElementById('resultBody').innerHTML=`<div class="stats">
+      <div class="stat"><div class="stat-val">${d.orig_mb} MB</div><div class="stat-label">Original</div></div>
+      <div class="stat"><div class="stat-val">${d.comp_mb} MB</div><div class="stat-label">Compressed</div></div>
+      <div class="stat"><div class="stat-val green">${d.saved_pct}% off</div><div class="stat-label">Saved</div></div>
+    </div><a class="dl-btn" href="/api/download/${encodeURIComponent(d.filename)}" download>⬇️ Download ${d.filename}</a>`;}
+  function showErr(m){const el=document.getElementById('result');el.className='result error';el.style.display='block';
     document.getElementById('resultTitle').textContent='❌ Error';
-    document.getElementById('resultBody').innerHTML=`<div class="error-msg">${msg.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;
-  }
+    document.getElementById('resultBody').innerHTML=`<div class="error-msg">${m.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>`;}
   document.getElementById('urlInput').addEventListener('keydown',e=>{if(e.key==='Enter')startCompress();});
 </script>
 </body>
