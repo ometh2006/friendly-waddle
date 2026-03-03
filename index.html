@@ -1,0 +1,500 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Smart Video Compressor</title>
+<style>
+  :root {
+    --bg:      #0f1117;
+    --card:    #1a1d27;
+    --border:  #2a2d3e;
+    --accent:  #6c63ff;
+    --accent2: #a78bfa;
+    --green:   #22c55e;
+    --red:     #ef4444;
+    --text:    #e2e8f0;
+    --muted:   #64748b;
+    --radius:  14px;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', system-ui, sans-serif;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 40px 16px 80px;
+  }
+
+  /* ── Header ── */
+  .header { text-align: center; margin-bottom: 40px; }
+  .header h1 {
+    font-size: clamp(1.8rem, 4vw, 2.6rem);
+    font-weight: 800;
+    background: linear-gradient(135deg, var(--accent), var(--accent2));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -0.5px;
+  }
+  .header p { color: var(--muted); margin-top: 8px; font-size: 0.95rem; }
+  .badge {
+    display: inline-block;
+    background: rgba(108,99,255,.15);
+    border: 1px solid rgba(108,99,255,.3);
+    color: var(--accent2);
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 3px 10px;
+    border-radius: 99px;
+    margin-top: 12px;
+    letter-spacing: .5px;
+    text-transform: uppercase;
+  }
+
+  /* ── Card ── */
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 28px;
+    width: 100%;
+    max-width: 620px;
+  }
+
+  /* ── Form elements ── */
+  label {
+    display: block;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: .6px;
+    margin-bottom: 8px;
+  }
+  input[type="text"], select {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--text);
+    font-size: 0.95rem;
+    padding: 12px 16px;
+    outline: none;
+    transition: border-color .2s;
+    appearance: none;
+  }
+  input[type="text"]:focus, select:focus {
+    border-color: var(--accent);
+  }
+  input::placeholder { color: var(--muted); }
+
+  .field { margin-bottom: 18px; }
+
+  .row { display: flex; gap: 14px; }
+  .row .field { flex: 1; }
+
+  /* ── Presets grid ── */
+  .presets {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 8px;
+    margin-bottom: 22px;
+  }
+  .preset-btn {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 10px 6px;
+    text-align: center;
+    transition: all .2s;
+    font-size: 0.85rem;
+  }
+  .preset-btn .res  { font-size: 1rem; font-weight: 700; color: var(--text); }
+  .preset-btn .save { font-size: 0.7rem; margin-top: 2px; }
+  .preset-btn:hover  { border-color: var(--accent); }
+  .preset-btn.active {
+    border-color: var(--accent);
+    background: rgba(108,99,255,.12);
+    color: var(--accent2);
+  }
+  .preset-btn.active .res { color: var(--accent2); }
+
+  /* ── Button ── */
+  .btn {
+    width: 100%;
+    background: linear-gradient(135deg, var(--accent), #8b5cf6);
+    border: none;
+    border-radius: 10px;
+    color: #fff;
+    cursor: pointer;
+    font-size: 1rem;
+    font-weight: 700;
+    padding: 14px;
+    transition: opacity .2s, transform .1s;
+    letter-spacing: .3px;
+  }
+  .btn:hover:not(:disabled) { opacity: .88; transform: translateY(-1px); }
+  .btn:active { transform: translateY(0); }
+  .btn:disabled { opacity: .45; cursor: not-allowed; }
+
+  /* ── Progress ── */
+  .progress-wrap {
+    display: none;
+    margin-top: 22px;
+  }
+  .progress-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.82rem;
+    color: var(--muted);
+    margin-bottom: 8px;
+  }
+  .progress-bar-bg {
+    background: var(--bg);
+    border-radius: 99px;
+    height: 8px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+  }
+  .progress-bar {
+    background: linear-gradient(90deg, var(--accent), var(--accent2));
+    height: 100%;
+    width: 0%;
+    border-radius: 99px;
+    transition: width .4s ease;
+  }
+  .spinner {
+    display: inline-block;
+    width: 14px; height: 14px;
+    border: 2px solid rgba(108,99,255,.3);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin .7s linear infinite;
+    vertical-align: middle;
+    margin-right: 6px;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  /* ── Result card ── */
+  .result {
+    display: none;
+    margin-top: 22px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px;
+  }
+  .result.success { border-color: rgba(34,197,94,.35); }
+  .result.error   { border-color: rgba(239,68,68,.35); }
+
+  .result-title {
+    font-weight: 700;
+    font-size: 0.95rem;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .result.error .result-title { color: var(--red); }
+  .result.success .result-title { color: var(--green); }
+
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 10px;
+    margin-bottom: 16px;
+  }
+  .stat {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px;
+    text-align: center;
+  }
+  .stat-val {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--text);
+  }
+  .stat-val.green { color: var(--green); }
+  .stat-label {
+    font-size: 0.7rem;
+    color: var(--muted);
+    margin-top: 3px;
+    text-transform: uppercase;
+    letter-spacing: .5px;
+  }
+
+  .dl-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    width: 100%;
+    background: rgba(34,197,94,.12);
+    border: 1px solid rgba(34,197,94,.35);
+    border-radius: 10px;
+    color: var(--green);
+    font-weight: 700;
+    font-size: 0.95rem;
+    padding: 12px;
+    cursor: pointer;
+    text-decoration: none;
+    transition: background .2s;
+  }
+  .dl-btn:hover { background: rgba(34,197,94,.22); }
+
+  .error-msg {
+    font-size: 0.82rem;
+    color: var(--red);
+    font-family: monospace;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+  }
+
+  /* ── How it works ── */
+  .how {
+    margin-top: 32px;
+    width: 100%;
+    max-width: 620px;
+  }
+  .how h3 {
+    font-size: 0.75rem;
+    text-transform: uppercase;
+    letter-spacing: .8px;
+    color: var(--muted);
+    margin-bottom: 12px;
+  }
+  .steps {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+  }
+  .step {
+    display: flex;
+    align-items: flex-start;
+    gap: 12px;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 0.85rem;
+    color: var(--muted);
+  }
+  .step-icon { font-size: 1.1rem; flex-shrink: 0; }
+  .step b { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="header">
+  <h1>🎬 Smart Video Compressor</h1>
+  <p>Paste a GoFile link — get back a small, compressed video file.</p>
+  <span class="badge">✦ HD file never saved to disk</span>
+</div>
+
+<div class="card">
+
+  <!-- URL input -->
+  <div class="field">
+    <label>GoFile Share Link or Direct Video URL</label>
+    <input type="text" id="urlInput"
+           placeholder="https://gofile.io/d/XXXXXX  or  https://…/video.mp4"/>
+  </div>
+
+  <!-- Quality presets -->
+  <label style="margin-bottom:10px">Output Quality</label>
+  <div class="presets">
+    <button class="preset-btn" data-preset="240p">
+      <div class="res">240p</div>
+      <div class="save">~94% off</div>
+    </button>
+    <button class="preset-btn active" data-preset="360p">
+      <div class="res">360p</div>
+      <div class="save">~88% off</div>
+    </button>
+    <button class="preset-btn" data-preset="480p">
+      <div class="res">480p</div>
+      <div class="save">~75% off</div>
+    </button>
+    <button class="preset-btn" data-preset="720p">
+      <div class="res">720p</div>
+      <div class="save">~50% off</div>
+    </button>
+  </div>
+
+  <button class="btn" id="compressBtn" onclick="startCompress()">
+    🚀 Compress Video
+  </button>
+
+  <!-- Progress -->
+  <div class="progress-wrap" id="progressWrap">
+    <div class="progress-label">
+      <span id="progressText"><span class="spinner"></span>Processing…</span>
+      <span id="progressPct"></span>
+    </div>
+    <div class="progress-bar-bg">
+      <div class="progress-bar" id="progressBar"></div>
+    </div>
+  </div>
+
+  <!-- Result -->
+  <div class="result" id="result">
+    <div class="result-title" id="resultTitle"></div>
+    <div id="resultBody"></div>
+  </div>
+
+</div>
+
+<!-- How it works -->
+<div class="how">
+  <h3>How it works</h3>
+  <div class="steps">
+    <div class="step">
+      <span class="step-icon">🔎</span>
+      <span><b>GoFile API</b> — paste your share link and the server auto-extracts the direct video URL. No manual copy-paste from DevTools needed.</span>
+    </div>
+    <div class="step">
+      <span class="step-icon">⚡</span>
+      <span><b>Stream → FFmpeg</b> — the server fetches the video over HTTP and pipes it directly into FFmpeg. <b>The original HD file is never stored.</b></span>
+    </div>
+    <div class="step">
+      <span class="step-icon">⬇️</span>
+      <span><b>Instant download</b> — once encoding finishes, click the download button to save the compressed file to your device.</span>
+    </div>
+  </div>
+</div>
+
+<script>
+  let selectedPreset = '360p';
+
+  // Preset buttons
+  document.querySelectorAll('.preset-btn').forEach(btn => {
+    btn.addEventListener('click', () => {
+      document.querySelectorAll('.preset-btn').forEach(b => b.classList.remove('active'));
+      btn.classList.add('active');
+      selectedPreset = btn.dataset.preset;
+    });
+  });
+
+  // Fake progress animation (FFmpeg doesn't report % easily via REST)
+  let progressInterval = null;
+
+  function startFakeProgress() {
+    let pct = 0;
+    const bar = document.getElementById('progressBar');
+    const pctEl = document.getElementById('progressPct');
+    // Ramp quickly to 30%, then slow to 90%, hold until done
+    progressInterval = setInterval(() => {
+      if (pct < 30)       pct += 2.5;
+      else if (pct < 70)  pct += 0.8;
+      else if (pct < 88)  pct += 0.2;
+      bar.style.width = pct + '%';
+      pctEl.textContent = Math.floor(pct) + '%';
+    }, 400);
+  }
+
+  function stopProgress(final = 100) {
+    clearInterval(progressInterval);
+    document.getElementById('progressBar').style.width = final + '%';
+    document.getElementById('progressPct').textContent = final + '%';
+  }
+
+  async function startCompress() {
+    const url = document.getElementById('urlInput').value.trim();
+    if (!url) {
+      showError('Please paste a GoFile link or direct video URL.');
+      return;
+    }
+
+    // Reset UI
+    const btn = document.getElementById('compressBtn');
+    btn.disabled = true;
+    btn.textContent = '⚙️ Compressing…';
+    document.getElementById('progressWrap').style.display = 'block';
+    document.getElementById('result').style.display = 'none';
+    document.getElementById('progressText').innerHTML =
+      '<span class="spinner"></span>Resolving URL…';
+    startFakeProgress();
+
+    try {
+      document.getElementById('progressText').innerHTML =
+        '<span class="spinner"></span>Encoding video… (this takes a few minutes)';
+
+      const res = await fetch('/api/compress', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url, preset: selectedPreset }),
+      });
+
+      const data = await res.json();
+      stopProgress(100);
+
+      if (!res.ok) {
+        showError(data.detail || 'Compression failed.');
+      } else {
+        showSuccess(data);
+      }
+    } catch (err) {
+      stopProgress(0);
+      showError('Network error: ' + err.message);
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '🚀 Compress Video';
+    }
+  }
+
+  function showSuccess(data) {
+    const el = document.getElementById('result');
+    el.className = 'result success';
+    el.style.display = 'block';
+    document.getElementById('resultTitle').textContent =
+      '✅ Done in ' + data.elapsed_sec + 's';
+    document.getElementById('resultBody').innerHTML = `
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-val">${data.orig_mb} MB</div>
+          <div class="stat-label">Original</div>
+        </div>
+        <div class="stat">
+          <div class="stat-val">${data.comp_mb} MB</div>
+          <div class="stat-label">Compressed</div>
+        </div>
+        <div class="stat">
+          <div class="stat-val green">${data.saved_pct}% off</div>
+          <div class="stat-label">Saved</div>
+        </div>
+      </div>
+      <a class="dl-btn" href="/api/download/${encodeURIComponent(data.filename)}" download>
+        ⬇️ Download ${data.filename}
+      </a>
+    `;
+  }
+
+  function showError(msg) {
+    const el = document.getElementById('result');
+    el.className = 'result error';
+    el.style.display = 'block';
+    document.getElementById('resultTitle').textContent = '❌ Error';
+    document.getElementById('resultBody').innerHTML =
+      `<div class="error-msg">${escHtml(msg)}</div>`;
+  }
+
+  function escHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  // Allow Enter key
+  document.getElementById('urlInput').addEventListener('keydown', e => {
+    if (e.key === 'Enter') startCompress();
+  });
+</script>
+</body>
+</html>
